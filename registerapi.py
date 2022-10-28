@@ -7,6 +7,12 @@ from flask_cors import cross_origin
 from passlib.hash import sha256_crypt
 import base64
 from flask_mysqldb import MySQL
+import uuid
+from functools import wraps
+import jwt
+from datetime import date
+import datetime
+from auth import token_required
 
 app = Flask(__name__)
 api = Blueprint('api', __name__)
@@ -102,10 +108,11 @@ def dcrypt_storage():
         addres = list_1[6:]
         address = ','.join(addres)
         password = sha256_crypt.hash(pas)
+        UUID = str(uuid.uuid4())
         cur = mysql.connection.cursor()
         res1 = cur.execute("SELECT userName FROM REGISTER_DETAIL WHERE userName= %s", [userName])
         if res1 == 0:
-            cur.execute("INSERT INTO REGISTER_DETAIL(fullName,companyName,companyWebsite,userName,email,contact,password,address) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",[fullName, companyName, companyWebsite, userName, email, contact, password, address])
+            cur.execute("INSERT INTO REGISTER_DETAIL(UUId,fullName,companyName,companyWebsite,userName,email,contact,password,address) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",[UUID, fullName, companyName, companyWebsite, userName, email, contact, password, address])
             cur.execute("INSERT INTO user_credentials(userName,password) VALUES (%s,%s)", (userName, password))
             mysql.connection.commit()
             cur.close()
@@ -119,6 +126,7 @@ def dcrypt_storage():
 @cross_origin(origin='*',headers=['Content-Type','Authorization'])
 def login():
     if request.method == 'POST':
+        # auth = request.authorization
         # Get Form Fields
         userName = request.json['userName']
         password_candidate = request.json['password']
@@ -126,28 +134,22 @@ def login():
         # Create cursor
         cur = mysql.connection.cursor()
         # Get user by username
-        result = cur.execute("SELECT * FROM user_credentials WHERE userName = %s", [userName])
+        result = cur.execute("SELECT * FROM REGISTER_DETAIL WHERE userName = %s", [userName])
         if result > 0:
             # Get stored hash
             data = cur.fetchone()
+            mysql.connection.commit()
+            cur.close()
             password = data['password']
-            # Compare Passwords
+            # Compare Passwords 
             if sha256_crypt.verify(password_candidate,password):
-                # Passed
-                session['logged_in'] = True
-                session['userName'] = userName
-                id=data['id']
-                encode_id = base64.b64encode(str(id).encode('ascii'))
-                idd = encode_id.decode('utf-8')
-                # decode_id = base64_decode(encode_id.decode('ascii'))
-                global user
-                user  = session['userName']
-                return jsonify({'success':True,'message':'Login Successfull','id':idd})
+                token = jwt.encode({'public_id':data['UUId'],'exp':datetime.datetime.utcnow()+datetime.timedelta(days=1)},str(app.config['SECRET_KEY']))
+                return jsonify({'success':True,'message':'Login Successfull','token':token})
             else:
                 return jsonify({'success':False,'message':'Invalid User Credentials'})
         else:
             return jsonify({'success':False,'message':'Username not found'})
-    return jsonify({"success":False,"message":"Welcome to login"})
+    return jsonify({"success":False,"message":"wreong request method"})
 
 """sending email to reset password"""
 @api.route('/api/emailreset',methods= ['POST','GET'])
@@ -215,7 +217,7 @@ def sendmobile_otp():
         global x
         otp = random.randint(0000,9999)
         session['otp'] = otp
-        x = session['otp']
+        x = session['otp'] 
         if 'otp' in session:
             session.pop('otp',None)
         return jsonify({'success': True, 'message': 'otp sent,{}'.format(otp)})
@@ -272,14 +274,64 @@ def updatepass_otp():
 
 @api.route('/api/getregister',methods=['GET'])
 @cross_origin(origin='*',headers=['Content-Type','Authorization'])
-def getregisterdata():
+@token_required
+def getregisterdata(current_user):
     if request.method == "GET":
         cur = mysql.connection.cursor()
-        cur.execute("SELECT fullName,companyName FROM REGISTER_DETAIL WHERE userName = %s",[user])
+        cur.execute("SELECT fullName,companyName FROM REGISTER_DETAIL WHERE id = %s",[current_user])
         result = cur.fetchone()
-        cur.close()
+        reupdate_by_expirydate(current_user)
         return jsonify({'success':True,'result':result})
     return jsonify({'success':False})
+
+def reupdate_by_expirydate(current_user):
+    cur = mysql.connection.cursor()
+    current_Date = date.today()
+    # keywords
+    key = cur.execute("SELECT * FROM `SERVICES` WHERE fid=%s AND status=%s AND service_name=%s",[current_user,"active","Keywords"])
+    if key>0:
+        ExpDate = cur.fetchone()
+        ExpiryDate = ExpDate.get('ExpiryDate')
+        mysql.connection.commit()
+        if ExpiryDate < current_Date:
+            cur.execute('UPDATE `SERVICES` SET status=%s WHERE  fid=%s AND status=%s AND service_name=%s',("DeActivated",current_user,"active","Keywords"))
+            cur.execute('DELETE FROM `usage` WHERE  fid=%s AND WordCloud IS NULL',[current_user])
+            users = cur.execute('SELECT * from `SERVICES` WHERE fid=%s AND status=%s AND service_name=%s',[current_user,"In-progress","Keywords"])
+            x = cur.fetchone()
+            mysql.connection.commit()
+            if users > 0:
+                min_pur_date = x.get('MIN(time)')
+                cur.execute('UPDATE `SERVICES` SET status=%s WHERE fid=%s AND time=%s AND service_name=%s AND status=%s',("active",current_user,min_pur_date,"Keywords","In-progress"))
+                mysql.connection.commit()
+                cur.execute("SELECT * FROM `SERVICES` WHERE fid=%s AND status=%s AND service_name=%s",[current_user,"active","Keywords"])
+                new_active = cur.fetchone()
+                usage_value = new_active.get('usage_value')
+                cur.execute('INSERT INTO `usage` (fid,Keywords,KeywordTotal) VALUES(%s,%s,%s)',[current_user,usage_value,usage_value])
+                mysql.connection.commit()
+    
+    # wordcloud
+    word = cur.execute('SELECT ExpiryDate,service_name FROM `SERVICES` WHERE fid=%s AND status=%s AND service_name=%s',[current_user,"active","WordCloud"])
+    if word>0:
+        data = cur.fetchone()
+        ExpiryDate = data.get('ExpiryDate')
+        mysql.connection.commit()
+        if ExpiryDate < current_Date:
+            cur.execute('UPDATE `SERVICES` SET status=%s WHERE  fid=%s AND status=%s AND service_name=%s',("DeActivated",current_user,"active","WordCloud"))
+            cur.execute('DELETE FROM `usage` WHERE  fid=%s AND Keywords IS NULL',[current_user])
+            users = cur.execute('SELECT MIN(time) from `SERVICES` WHERE fid=%s AND status=%s AND service_name=%s',[current_user,"In-progress","WordCloud"])
+            x = cur.fetchone()
+            mysql.connection.commit()
+            if users > 0:
+                min_pur_date = x.get('MIN(time)')
+                cur.execute('UPDATE `SERVICES` SET status=%s WHERE fid=%s AND time=%s AND service_name=%s AND status=%s',("active",current_user,min_pur_date,"WordCloud","In-progress"))
+                mysql.connection.commit()
+                v = cur.execute("SELECT * FROM `SERVICES` WHERE fid=%s AND status=%s AND service_name=%s",[current_user,"active","WordCloud"])
+                new_active = cur.fetchone()
+                usage_value = new_active.get('usage_value')
+                cur.execute('INSERT INTO `usage` (fid,WordCloud,WordcloudTotal) VALUES(%s,%s,%s)',[current_user,usage_value,usage_value])
+                mysql.connection.commit()
+    cur.close()
+    
 
 @api.route('/api/logout',methods=['GET','POST'])
 @cross_origin(origin='*',headers=['Content-Type','Authorization'])
